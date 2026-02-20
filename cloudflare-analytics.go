@@ -767,21 +767,19 @@ func pakasirWebhookHandler(w http.ResponseWriter, r *http.Request) {
 
 // updateOrderPaymentStatus - call Vercel API to update Firestore
 func updateOrderPaymentStatus(payload PakasirWebhookPayload) {
-	// Vercel API URL - sesuaikan dengan deployment URL kamu
-	vercelURL := os.Getenv("VERCEL_API_URL")
-	if vercelURL == "" {
-		// If not set, leave empty and fall back to common local hosts below
-		vercelURL = ""
+	// FRONTEND_URL: primary frontend base URL (set in env). If empty,
+	// fall back to the production frontend https://www.feelin.my.id
+	frontendURL := os.Getenv("FRONTEND_URL")
+	if frontendURL == "" {
+		frontendURL = "https://www.feelin.my.id"
 	}
 
-	// Candidate endpoints to try (in order)
+	// Candidate endpoints to try (in order):
+	// 1) FRONTEND_URL + /api/update-payment-status
+	// 2) https://www.feelin.my.id/api/update-payment-status (fallback)
 	candidates := []string{}
-	if vercelURL != "" {
-		candidates = append(candidates, strings.TrimRight(vercelURL, "/")+"/api/update-payment-status")
-	}
-	// Common local fallbacks
-	candidates = append(candidates, "http://localhost:3000/api/update-payment-status")
-	candidates = append(candidates, "http://localhost:5173/api/update-payment-status")
+	candidates = append(candidates, strings.TrimRight(frontendURL, "/")+"/api/update-payment-status")
+	candidates = append(candidates, "https://www.feelin.my.id/api/update-payment-status")
 
 	// Prepare request body
 	requestBody, err := json.Marshal(map[string]interface{}{
