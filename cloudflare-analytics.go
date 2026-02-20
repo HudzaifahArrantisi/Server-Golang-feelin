@@ -45,8 +45,32 @@ type CloudflareResponse struct {
 func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		if origin == "http://localhost:3000" || origin == "http://localhost:5173" {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
+
+		// Allowed exact origins
+		allowedOrigins := []string{
+			"http://localhost:3000",
+			"http://localhost:5173",
+			"https://feelin.my.id",
+			"https://www.feelin.my.id",
+		}
+
+		allowed := ""
+		for _, a := range allowedOrigins {
+			if origin == a {
+				allowed = a
+				break
+			}
+		}
+
+		// Allow preview Vercel domains like https://feelin-<hash>.vercel.app
+		if allowed == "" && origin != "" {
+			if strings.HasPrefix(origin, "https://feelin-") && strings.HasSuffix(origin, ".vercel.app") {
+				allowed = origin
+			}
+		}
+
+		if allowed != "" {
+			w.Header().Set("Access-Control-Allow-Origin", allowed)
 		} else {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 		}
@@ -864,7 +888,6 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
-
 
 	// Clean startup banner
 	fmt.Println()
