@@ -311,11 +311,11 @@ func cfDebugHandler(w http.ResponseWriter, r *http.Request) {
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"env_vars": map[string]string{
-			"CF_READ_ALL_TOKEN":    maskToken(cfToken),
-			"CLOUDFLARE_API_TOKEN": maskToken(os.Getenv("CLOUDFLARE_API_TOKEN")),
-			"ZONE_ID":              maskToken(os.Getenv("ZONE_ID")),
+			"CF_READ_ALL_TOKEN":     maskToken(cfToken),
+			"CLOUDFLARE_API_TOKEN":  maskToken(os.Getenv("CLOUDFLARE_API_TOKEN")),
+			"ZONE_ID":               maskToken(os.Getenv("ZONE_ID")),
 			"CLOUDINARY_CLOUD_NAME": maskToken(os.Getenv("CLOUDINARY_CLOUD_NAME")),
-			"HR_EMAIL":             maskToken(os.Getenv("HR_EMAIL")),
+			"HR_EMAIL":              maskToken(os.Getenv("HR_EMAIL")),
 		},
 		"cloudflare_verify_test": verifyStatus,
 	})
@@ -676,10 +676,11 @@ func checkPaymentStatusHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // ═══════════════════════════════════════════════════════
-// SUBMIT APPLICATION — upload file + kirim email ke HR
+// SUBMIT APPLICATION
 // POST /api/submit-application
 // ═══════════════════════════════════════════════════════
 
+// ✅ FIX: Deteksi resource_type berdasarkan ekstensi agar PDF tidak ditolak Cloudinary
 func uploadToCloudinary(fileBytes []byte, filename, label string) UploadResult {
 	cloudName := os.Getenv("CLOUDINARY_CLOUD_NAME")
 	uploadPreset := os.Getenv("CLOUDINARY_UPLOAD_PRESET")
@@ -692,44 +693,63 @@ func uploadToCloudinary(fileBytes []byte, filename, label string) UploadResult {
 
 	log.Printf("☁️  [Cloudinary] %s: %s", label, filename)
 
+	// Deteksi resource_type berdasarkan ekstensi
+	ext := ""
+	if idx := strings.LastIndex(filename, "."); idx >= 0 {
+		ext = strings.ToLower(filename[idx+1:])
+	}
+	resourceType := "image"
+	if ext == "pdf" || ext == "doc" || ext == "docx" {
+		resourceType = "raw"
+	}
+
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
 	writer.WriteField("upload_preset", uploadPreset)
 	writer.WriteField("folder", "feelin-coffee-recruitment")
+
 	part, err := writer.CreateFormFile("file", filename)
 	if err != nil {
-		return UploadResult{Error: err.Error()}
+		return UploadResult{Error: "CreateFormFile error: " + err.Error()}
 	}
 	part.Write(fileBytes)
 	writer.Close()
 
-	req, _ := http.NewRequest("POST",
-		fmt.Sprintf("https://api.cloudinary.com/v1_1/%s/image/upload", cloudName),
-		&body)
+	// ✅ FIX: Pakai resource_type yang sesuai di URL endpoint
+	uploadURL := fmt.Sprintf("https://api.cloudinary.com/v1_1/%s/%s/upload", cloudName, resourceType)
+	log.Printf("☁️  [Cloudinary] URL: %s (resource_type=%s)", uploadURL, resourceType)
+
+	req, err := http.NewRequest("POST", uploadURL, &body)
+	if err != nil {
+		return UploadResult{Error: "NewRequest error: " + err.Error()}
+	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
 	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return UploadResult{Error: "Cloudinary error: " + err.Error()}
+		return UploadResult{Error: "Cloudinary network error: " + err.Error()}
 	}
 	defer resp.Body.Close()
 
 	respBody, _ := ioutil.ReadAll(resp.Body)
+	log.Printf("☁️  [Cloudinary] Response HTTP %d: %s", resp.StatusCode, string(respBody))
+
 	var result map[string]interface{}
 	json.Unmarshal(respBody, &result)
 
-	if secureURL, ok := result["secure_url"].(string); ok {
+	if secureURL, ok := result["secure_url"].(string); ok && secureURL != "" {
 		log.Printf("✅ [Cloudinary] %s → %s", label, secureURL)
 		return UploadResult{Success: true, URL: secureURL}
 	}
 
-	errMsg := "Unknown Cloudinary error"
+	errMsg := fmt.Sprintf("Cloudinary HTTP %d", resp.StatusCode)
 	if errObj, ok := result["error"].(map[string]interface{}); ok {
 		if msg, ok := errObj["message"].(string); ok {
-			errMsg = msg
+			errMsg = "Cloudinary: " + msg
 		}
 	}
+	log.Printf("❌ [Cloudinary] %s gagal: %s", label, errMsg)
 	return UploadResult{Error: errMsg}
 }
 
@@ -820,9 +840,12 @@ func sendEmailToHR(fields map[string]string, urls ApplicationFileURLs) error {
 	wf("_template", "table")
 	writer.Close()
 
-	req, _ := http.NewRequest("POST",
+	req, err := http.NewRequest("POST",
 		fmt.Sprintf("https://formsubmit.co/ajax/%s", hrEmail),
 		&body)
+	if err != nil {
+		return fmt.Errorf("NewRequest error: %v", err)
+	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	req.Header.Set("Accept", "application/json")
 
@@ -868,7 +891,7 @@ func submitApplicationHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("📨 Lamaran masuk: %s → %s", fields["fullName"], fields["position"])
 
-	// Helper baca file dari form
+	// ✅ Helper baca file dari form dengan logging
 	readFile := func(key string) ([]byte, string, bool) {
 		file, header, err := r.FormFile(key)
 		if err != nil {
@@ -877,8 +900,10 @@ func submitApplicationHandler(w http.ResponseWriter, r *http.Request) {
 		defer file.Close()
 		data, err := ioutil.ReadAll(file)
 		if err != nil {
+			log.Printf("❌ readFile(%s) error: %v", key, err)
 			return nil, "", false
 		}
+		log.Printf("📎 File diterima: %s → %s (%d bytes)", key, header.Filename, len(data))
 		return data, header.Filename, true
 	}
 
@@ -890,12 +915,16 @@ func submitApplicationHandler(w http.ResponseWriter, r *http.Request) {
 	ch := make(chan uploadJob, 4)
 
 	uploadAsync := func(key, linkKey string, useCloudinary bool) {
+		// Prioritaskan link manual
 		if link := r.FormValue(linkKey); link != "" {
+			log.Printf("🔗 %s: pakai link manual → %s", key, link)
 			ch <- uploadJob{key, UploadResult{Success: true, URL: link}}
 			return
 		}
+		// Coba baca file
 		data, filename, ok := readFile(key + "File")
 		if !ok {
+			log.Printf("ℹ️  %s: tidak ada file dan tidak ada link", key)
 			ch <- uploadJob{key, UploadResult{}}
 			return
 		}
@@ -906,16 +935,20 @@ func submitApplicationHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	go uploadAsync("cv", "cvLink", false)        // CV → Litterbox
-	go uploadAsync("photo", "photoLink", true)    // Foto → Cloudinary
-	go uploadAsync("ktp", "ktpLink", true)        // KTP → Cloudinary
-	go func() {                                    // Sertifikat → auto
+	go uploadAsync("cv",    "cvLink",    false) // CV → Litterbox (PDF/DOC)
+	go uploadAsync("photo", "photoLink", true)  // Foto → Cloudinary
+	go uploadAsync("ktp",   "ktpLink",   true)  // KTP → Cloudinary
+
+	// Sertifikat: PDF → Litterbox, gambar → Cloudinary
+	go func() {
 		if link := r.FormValue("certificateLink"); link != "" {
+			log.Printf("🔗 certificate: pakai link manual → %s", link)
 			ch <- uploadJob{"certificate", UploadResult{Success: true, URL: link}}
 			return
 		}
 		data, filename, ok := readFile("certificateFile")
 		if !ok {
+			log.Printf("ℹ️  certificate: tidak ada file dan tidak ada link")
 			ch <- uploadJob{"certificate", UploadResult{}}
 			return
 		}
@@ -932,8 +965,20 @@ func submitApplicationHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Kumpulkan hasil upload
 	urls := ApplicationFileURLs{}
+	uploadErrors := []string{}
+
 	for i := 0; i < 4; i++ {
 		job := <-ch
+		// ✅ FIX: Log setiap hasil — sukses maupun gagal
+		if job.result.Success {
+			log.Printf("✅ Upload %s berhasil → %s", job.key, job.result.URL)
+		} else if job.result.Error != "" {
+			log.Printf("❌ Upload %s GAGAL: %s", job.key, job.result.Error)
+			uploadErrors = append(uploadErrors, fmt.Sprintf("%s: %s", job.key, job.result.Error))
+		} else {
+			log.Printf("ℹ️  Upload %s: tidak ada file/link", job.key)
+		}
+
 		switch job.key {
 		case "cv":
 			urls.CvURL = job.result.URL
@@ -946,7 +991,7 @@ func submitApplicationHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	log.Printf("📊 URLs → cv:%s photo:%s ktp:%s cert:%s",
+	log.Printf("📊 Final URLs → cv:%q photo:%q ktp:%q cert:%q",
 		urls.CvURL, urls.PhotoURL, urls.KtpURL, urls.CertificateURL)
 
 	// Kirim email ke HR
@@ -958,12 +1003,18 @@ func submitApplicationHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("✅ Email HR terkirim")
 	}
 
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	// ✅ Response lengkap ke frontend — fileUrls wajib ada agar Firestore bisa simpan URL
+	response := map[string]interface{}{
 		"success":      true,
 		"emailSuccess": emailSuccess,
 		"fileUrls":     urls,
 		"message":      "Lamaran berhasil diproses",
-	})
+	}
+	if len(uploadErrors) > 0 {
+		response["uploadWarnings"] = uploadErrors
+	}
+
+	json.NewEncoder(w).Encode(response)
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1016,23 +1067,23 @@ func main() {
 	fmt.Println()
 
 	// Routes
-	http.HandleFunc("/api/submit-application", corsMiddleware(submitApplicationHandler))
-	http.HandleFunc("/api/cloudflare-analytics", corsMiddleware(cloudflareHandler))
-	http.HandleFunc("/api/cf/verify", corsMiddleware(cfVerifyTokenHandler))
-	http.HandleFunc("/api/cf/accounts", corsMiddleware(cfAccountsHandler))
-	http.HandleFunc("/api/cf/zones", corsMiddleware(cfZonesHandler))
-	http.HandleFunc("/api/cf/dns", corsMiddleware(cfDNSHandler))
-	http.HandleFunc("/api/cf/firewall", corsMiddleware(cfFirewallHandler))
-	http.HandleFunc("/api/cf/pagerules", corsMiddleware(cfPageRulesHandler))
-	http.HandleFunc("/api/cf/ssl", corsMiddleware(cfSSLHandler))
-	http.HandleFunc("/api/cf/waf", corsMiddleware(cfWAFHandler))
+	http.HandleFunc("/api/submit-application",        corsMiddleware(submitApplicationHandler))
+	http.HandleFunc("/api/cloudflare-analytics",      corsMiddleware(cloudflareHandler))
+	http.HandleFunc("/api/cf/verify",                 corsMiddleware(cfVerifyTokenHandler))
+	http.HandleFunc("/api/cf/accounts",               corsMiddleware(cfAccountsHandler))
+	http.HandleFunc("/api/cf/zones",                  corsMiddleware(cfZonesHandler))
+	http.HandleFunc("/api/cf/dns",                    corsMiddleware(cfDNSHandler))
+	http.HandleFunc("/api/cf/firewall",               corsMiddleware(cfFirewallHandler))
+	http.HandleFunc("/api/cf/pagerules",              corsMiddleware(cfPageRulesHandler))
+	http.HandleFunc("/api/cf/ssl",                    corsMiddleware(cfSSLHandler))
+	http.HandleFunc("/api/cf/waf",                    corsMiddleware(cfWAFHandler))
 	http.HandleFunc("/api/pakasir-create-transaction", corsMiddleware(pakasirHandler))
-	http.HandleFunc("/api/pakasir-webhook", corsMiddleware(pakasirWebhookHandler))
-	http.HandleFunc("/api/webhook/pakasir", corsMiddleware(pakasirWebhookHandler))
-	http.HandleFunc("/api/check-payment-status", corsMiddleware(checkPaymentStatusHandler))
-	http.HandleFunc("/api/health", corsMiddleware(healthHandler))
-	http.HandleFunc("/api/test", corsMiddleware(testHandler))
-	http.HandleFunc("/api/cf/debug", corsMiddleware(cfDebugHandler))
+	http.HandleFunc("/api/pakasir-webhook",            corsMiddleware(pakasirWebhookHandler))
+	http.HandleFunc("/api/webhook/pakasir",            corsMiddleware(pakasirWebhookHandler))
+	http.HandleFunc("/api/check-payment-status",       corsMiddleware(checkPaymentStatusHandler))
+	http.HandleFunc("/api/health",                     corsMiddleware(healthHandler))
+	http.HandleFunc("/api/test",                       corsMiddleware(testHandler))
+	http.HandleFunc("/api/cf/debug",                   corsMiddleware(cfDebugHandler))
 
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatal("❌ Server failed:", err)
