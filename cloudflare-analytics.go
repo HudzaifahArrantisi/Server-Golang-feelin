@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"strings"
@@ -15,7 +16,8 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// In-memory storage untuk webhook payment status
+// ─── Structs ──────────────────────────────────────────────────────────────────
+
 type PaymentStatus struct {
 	OrderID       string    `json:"order_id"`
 	Status        string    `json:"status"`
@@ -42,11 +44,51 @@ type CloudflareResponse struct {
 	Zone   string      `json:"zone,omitempty"`
 }
 
+type PakasirRequest struct {
+	OrderID       string `json:"order_id"`
+	Amount        int    `json:"amount"`
+	PaymentMethod string `json:"payment_method,omitempty"`
+}
+
+type PakasirAPIRequest struct {
+	Project string `json:"project"`
+	OrderID string `json:"order_id"`
+	Amount  int    `json:"amount"`
+	ApiKey  string `json:"api_key"`
+}
+
+type PakasirWebhookPayload struct {
+	OrderID       string `json:"order_id"`
+	Amount        int    `json:"amount"`
+	Project       string `json:"project"`
+	Status        string `json:"status"`
+	PaymentMethod string `json:"payment_method"`
+	CompletedAt   string `json:"completed_at"`
+}
+
+// ─── Upload result struct ─────────────────────────────────────────────────────
+
+type UploadResult struct {
+	Success bool
+	URL     string
+	Error   string
+}
+
+type ApplicationFileURLs struct {
+	CvURL          string `json:"cvUrl"`
+	PhotoURL       string `json:"photoUrl"`
+	KtpURL         string `json:"ktpUrl"`
+	CertificateURL string `json:"certificateUrl"`
+}
+
+// ═══════════════════════════════════════════════════════
+// CORS MIDDLEWARE
+// ═══════════════════════════════════════════════════════
+
 func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 
-		// Allowed exact origins
 		allowedOrigins := []string{
 			"http://localhost:3000",
 			"http://localhost:5173",
@@ -62,7 +104,6 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			}
 		}
 
-		// Allow preview Vercel domains like https://feelin-<hash>.vercel.app
 		if allowed == "" && origin != "" {
 			if strings.HasPrefix(origin, "https://feelin-") && strings.HasSuffix(origin, ".vercel.app") {
 				allowed = origin
@@ -89,12 +130,14 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// Handler untuk Cloudflare Analytics (GraphQL)
+// ═══════════════════════════════════════════════════════
+// CLOUDFLARE ANALYTICS
+// ═══════════════════════════════════════════════════════
+
 func cloudflareHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	zoneID := os.Getenv("ZONE_ID")
-	// Allow optional token override from admin UI (sent via X-Cloudflare-Token header)
 	token := r.Header.Get("X-Cloudflare-Token")
 	if token == "" {
 		token = os.Getenv("CLOUDFLARE_API_TOKEN")
@@ -104,12 +147,10 @@ func cloudflareHandler(w http.ResponseWriter, r *http.Request) {
 
 	if zoneID == "" || token == "" {
 		log.Printf("❌ Missing credentials")
-		response := CloudflareResponse{
+		json.NewEncoder(w).Encode(CloudflareResponse{
 			Status: "error",
-			Error:  "ZONE_ID atau CLOUDFLARE_API_TOKEN belum diatur di .env file (atau token tidak diberikan)",
-		}
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(response)
+			Error:  "ZONE_ID atau CLOUDFLARE_API_TOKEN belum diatur di .env file",
+		})
 		return
 	}
 
@@ -125,19 +166,9 @@ func cloudflareHandler(w http.ResponseWriter, r *http.Request) {
           date_leq: $datetimeEnd
         }
       ) {
-        dimensions {
-          date
-        }
-        sum {
-          bytes
-          cachedBytes
-          cachedRequests
-          requests
-          threats
-        }
-        uniq {
-          uniques
-        }
+        dimensions { date }
+        sum { bytes cachedBytes cachedRequests requests threats }
+        uniq { uniques }
       }
     }
   }
@@ -145,149 +176,109 @@ func cloudflareHandler(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 	sevenDaysAgo := now.AddDate(0, 0, -7)
-	dateStart := sevenDaysAgo.Format("2006-01-02")
-	dateEnd := now.Format("2006-01-02")
-
-	variables := map[string]interface{}{
-		"zoneTag":       zoneID,
-		"datetimeStart": dateStart,
-		"datetimeEnd":   dateEnd,
-	}
-
-	log.Printf("Sending GraphQL query to Cloudflare...")
-	log.Printf("Date range: %s to %s", dateStart, dateEnd)
 
 	payload := GraphQLRequest{
-		Query:     query,
-		Variables: variables,
+		Query: query,
+		Variables: map[string]interface{}{
+			"zoneTag":       zoneID,
+			"datetimeStart": sevenDaysAgo.Format("2006-01-02"),
+			"datetimeEnd":   now.Format("2006-01-02"),
+		},
 	}
 
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
-		log.Printf("❌ Failed to marshal payload: %v", err)
-		response := CloudflareResponse{
-			Status: "error",
-			Error:  fmt.Sprintf("Gagal membuat payload: %v", err),
-		}
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(response)
+		json.NewEncoder(w).Encode(CloudflareResponse{Status: "error", Error: err.Error()})
 		return
 	}
 
 	req, err := http.NewRequest("POST", "https://api.cloudflare.com/client/v4/graphql", bytes.NewBuffer(payloadBytes))
 	if err != nil {
-		log.Printf("Failed to create request: %v", err)
-		response := CloudflareResponse{
-			Status: "error",
-			Error:  fmt.Sprintf("Gagal membuat request: %v", err),
-		}
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(response)
+		json.NewEncoder(w).Encode(CloudflareResponse{Status: "error", Error: err.Error()})
 		return
 	}
-
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("Failed to send request: %v", err)
-		response := CloudflareResponse{
-			Status: "error",
-			Error:  fmt.Sprintf("Gagal mengirim request ke Cloudflare: %v", err),
-		}
 		w.WriteHeader(http.StatusBadGateway)
-		json.NewEncoder(w).Encode(response)
+		json.NewEncoder(w).Encode(CloudflareResponse{Status: "error", Error: err.Error()})
 		return
 	}
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Printf("Failed to read response: %v", err)
-		response := CloudflareResponse{
-			Status: "error",
-			Error:  fmt.Sprintf("Gagal membaca response: %v", err),
-		}
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(response)
-		return
-	}
-
-	log.Printf("📥 Cloudflare Response Status: %d", resp.StatusCode)
-
+	body, _ := ioutil.ReadAll(resp.Body)
 	var result map[string]interface{}
 	if err := json.Unmarshal(body, &result); err != nil {
-		log.Printf("Failed to parse JSON: %v", err)
-		response := CloudflareResponse{
-			Status: "error",
-			Error:  fmt.Sprintf("Response dari Cloudflare bukan JSON valid: %v", err),
-		}
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(response)
+		json.NewEncoder(w).Encode(CloudflareResponse{Status: "error", Error: "Response bukan JSON valid"})
 		return
 	}
 
 	if errors, ok := result["errors"].([]interface{}); ok && len(errors) > 0 {
 		errorMsg := "Unknown error from Cloudflare"
-		var errorDetails []string
-
-		for i, e := range errors {
-			if errObj, ok := e.(map[string]interface{}); ok {
-				if msg, ok := errObj["message"].(string); ok {
-					errorDetails = append(errorDetails, fmt.Sprintf("Error %d: %s", i+1, msg))
-					if i == 0 {
-						errorMsg = msg
-					}
-				}
+		if errObj, ok := errors[0].(map[string]interface{}); ok {
+			if msg, ok := errObj["message"].(string); ok {
+				errorMsg = msg
 			}
 		}
-
-		log.Printf("Cloudflare API Errors:")
-		for _, detail := range errorDetails {
-			log.Printf("   - %s", detail)
-		}
-
-		fullErrorMsg := errorMsg
-		if len(errorDetails) > 1 {
-			fullErrorMsg = fmt.Sprintf("%s (dan %d error lainnya - lihat log server)", errorMsg, len(errorDetails)-1)
-		}
-
-		response := CloudflareResponse{
-			Status: "error",
-			Error:  fullErrorMsg,
-		}
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(response)
+		json.NewEncoder(w).Encode(CloudflareResponse{Status: "error", Error: errorMsg})
 		return
 	}
 
-	log.Printf(" Analytics fetched successfully for zone: %s", zoneID)
-
-	response := CloudflareResponse{
-		Status: "success",
-		Data:   result,
-		Zone:   zoneID,
-	}
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(response)
+	log.Printf("✅ Analytics fetched for zone: %s", zoneID)
+	json.NewEncoder(w).Encode(CloudflareResponse{Status: "success", Data: result, Zone: zoneID})
 }
 
-// Cloudflare Radar functionality removed — use CF_READ_ALL_TOKEN-based endpoints only
+// ═══════════════════════════════════════════════════════
+// HEALTH & TEST
+// ═══════════════════════════════════════════════════════
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	response := map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":    "healthy",
-		"service":   "cloudflare-analytics-proxy",
+		"service":   "feelin-coffee-server",
 		"timestamp": time.Now().Format(time.RFC3339),
-		"version":   "4.0.0",
-	}
-	json.NewEncoder(w).Encode(response)
+		"version":   "5.0.0",
+	})
 }
 
-// /api/cf/debug — cek semua env var yang terbaca server (token di-mask aman)
+func testHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	zoneID := os.Getenv("ZONE_ID")
+	apiToken := os.Getenv("CLOUDFLARE_API_TOKEN")
+	readAllToken := os.Getenv("CF_READ_ALL_TOKEN")
+
+	maskToken := func(t string) string {
+		if t == "" || len(t) <= 8 {
+			return t
+		}
+		return t[:4] + "..." + t[len(t)-4:]
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"service":              "Feelin Coffee Server",
+		"status":               "running",
+		"zone_id":              zoneID,
+		"has_api_token":        apiToken != "",
+		"api_token_masked":     maskToken(apiToken),
+		"has_readall_token":    readAllToken != "",
+		"readall_token_masked": maskToken(readAllToken),
+		"timestamp":            time.Now().Format(time.RFC3339),
+		"endpoints": map[string]string{
+			"analytics":          "/api/cloudflare-analytics",
+			"submit_application": "/api/submit-application",
+			"health":             "/api/health",
+		},
+	})
+}
+
 func cfDebugHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -296,17 +287,12 @@ func cfDebugHandler(w http.ResponseWriter, r *http.Request) {
 			return "❌ KOSONG / TIDAK TERBACA"
 		}
 		if len(t) <= 8 {
-			return "✅ ADA (terlalu pendek: " + t + ")"
+			return "✅ ADA (terlalu pendek)"
 		}
 		return "✅ ADA → " + t[:4] + "****" + t[len(t)-4:]
 	}
 
 	cfToken := os.Getenv("CF_READ_ALL_TOKEN")
-	analyticsToken := os.Getenv("CLOUDFLARE_API_TOKEN")
-	// CLOUDFLARE_RADAR_API_TOKEN intentionally removed from this project.
-	zoneID := os.Getenv("ZONE_ID")
-
-	// Coba panggil Cloudflare verify dengan token yang ada
 	verifyStatus := "skip"
 	if cfToken != "" {
 		req, err := http.NewRequest("GET", "https://api.cloudflare.com/client/v4/user/tokens/verify", nil)
@@ -326,211 +312,19 @@ func cfDebugHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"env_vars": map[string]string{
 			"CF_READ_ALL_TOKEN":    maskToken(cfToken),
-			"CLOUDFLARE_API_TOKEN": maskToken(analyticsToken),
-			"ZONE_ID":              maskToken(zoneID),
+			"CLOUDFLARE_API_TOKEN": maskToken(os.Getenv("CLOUDFLARE_API_TOKEN")),
+			"ZONE_ID":              maskToken(os.Getenv("ZONE_ID")),
+			"CLOUDINARY_CLOUD_NAME": maskToken(os.Getenv("CLOUDINARY_CLOUD_NAME")),
+			"HR_EMAIL":             maskToken(os.Getenv("HR_EMAIL")),
 		},
 		"cloudflare_verify_test": verifyStatus,
-		"hint":                   "Jika CF_READ_ALL_TOKEN KOSONG → pastikan file .env di root project berisi CF_READ_ALL_TOKEN=xxx lalu restart server",
 	})
 }
 
-func testHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	zoneID := os.Getenv("ZONE_ID")
-	apiToken := os.Getenv("CLOUDFLARE_API_TOKEN")
-	readAllToken := os.Getenv("CF_READ_ALL_TOKEN")
-
-	hasApiToken := apiToken != ""
-	hasReadAll := readAllToken != ""
-
-	maskedApiToken := ""
-	if hasApiToken && len(apiToken) > 8 {
-		maskedApiToken = apiToken[:4] + "..." + apiToken[len(apiToken)-4:]
-	}
-
-	maskedReadAll := ""
-	if hasReadAll && len(readAllToken) > 8 {
-		maskedReadAll = readAllToken[:4] + "..." + readAllToken[len(readAllToken)-4:]
-	}
-
-	response := map[string]interface{}{
-		"service":              "Cloudflare Analytics Proxy",
-		"status":               "running",
-		"zone_id":              zoneID,
-		"has_api_token":        hasApiToken,
-		"api_token_masked":     maskedApiToken,
-		"has_readall_token":    hasReadAll,
-		"readall_token_masked": maskedReadAll,
-		"timestamp":            time.Now().Format(time.RFC3339),
-		"endpoints": map[string]string{
-			"analytics": "/api/cloudflare-analytics",
-			"health":    "/api/health",
-			"test":      "/api/test",
-		},
-		"api_docs": map[string]string{
-			"analytics": "https://developers.cloudflare.com/analytics/graphql-api/",
-		},
-	}
-	json.NewEncoder(w).Encode(response)
-}
-
-// Pakasir API Request/Response structures
-type PakasirRequest struct {
-	OrderID       string `json:"order_id"`
-	Amount        int    `json:"amount"`
-	PaymentMethod string `json:"payment_method,omitempty"`
-}
-
-type PakasirAPIRequest struct {
-	Project string `json:"project"`
-	OrderID string `json:"order_id"`
-	Amount  int    `json:"amount"`
-	ApiKey  string `json:"api_key"`
-}
-
-// Handler untuk Pakasir Payment API (proxy to avoid CORS)
-func pakasirHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-
-	if r.Method != "POST" {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
-		return
-	}
-
-	// Read raw body for debugging
-	bodyBytes, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		log.Printf("❌ Failed to read request body: %v", err)
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to read request body"})
-		return
-	}
-	log.Printf("📥 Received request body: %s", string(bodyBytes))
-
-	// Parse request body
-	var reqBody PakasirRequest
-	if err := json.Unmarshal(bodyBytes, &reqBody); err != nil {
-		log.Printf("❌ Failed to parse request body: %v", err)
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body", "details": err.Error()})
-		return
-	}
-
-	log.Printf("📦 Parsed request: order_id=%s, amount=%d", reqBody.OrderID, reqBody.Amount)
-
-	if reqBody.OrderID == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "order_id is required"})
-		return
-	}
-
-	if reqBody.Amount <= 0 {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "amount must be greater than 0"})
-		return
-	}
-
-	paymentMethod := reqBody.PaymentMethod
-	if paymentMethod == "" {
-		paymentMethod = "qris"
-	}
-
-	// Pakasir API credentials
-	pakasirProject := os.Getenv("PAKASIR_PROJECT")
-	if pakasirProject == "" {
-		pakasirProject = "feelin"
-	}
-	pakasirApiKey := os.Getenv("PAKASIR_API_KEY")
-	if pakasirApiKey == "" {
-		log.Printf("PAKASIR_API_KEY not set in environment")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Server misconfiguration"})
-		return
-	}
-
-	log.Printf("📦 Creating Pakasir transaction: order=%s, amount=%d, method=%s", reqBody.OrderID, reqBody.Amount, paymentMethod)
-
-	// Build Pakasir API request - using map for flexibility
-	pakasirReq := map[string]interface{}{
-		"project":  pakasirProject,
-		"order_id": reqBody.OrderID,
-		"amount":   reqBody.Amount,
-		"api_key":  pakasirApiKey,
-	}
-
-	payloadBytes, err := json.Marshal(pakasirReq)
-	if err != nil {
-		log.Printf("❌ Failed to marshal Pakasir request: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to create request"})
-		return
-	}
-
-	log.Printf("📤 Sending to Pakasir: %s", string(payloadBytes))
-
-	// Call Pakasir API
-	pakasirURL := fmt.Sprintf("https://app.pakasir.com/api/transactioncreate/%s", paymentMethod)
-	log.Printf("📡 Pakasir URL: %s", pakasirURL)
-
-	req, err := http.NewRequest("POST", pakasirURL, bytes.NewBuffer(payloadBytes))
-	if err != nil {
-		log.Printf("❌ Failed to create Pakasir request: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to create request"})
-		return
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("❌ Pakasir API error: %v", err)
-		w.WriteHeader(http.StatusBadGateway)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to connect to Pakasir API"})
-		return
-	}
-	defer resp.Body.Close()
-
-	// Read and forward the response
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Printf("❌ Failed to read Pakasir response: %v", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to read response"})
-		return
-	}
-
-	log.Printf("✅ Pakasir response status: %d", resp.StatusCode)
-	log.Printf("📥 Pakasir response body: %s", string(body))
-
-	// Forward status code and body
-	w.WriteHeader(resp.StatusCode)
-	w.Write(body)
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
 // ═══════════════════════════════════════════════════════
-// CF OVERVIEW PROXY HANDLERS (Read All Resources Token)
-// Token dibaca dari env CF_READ_ALL_TOKEN atau header X-CF-Read-Token
+// CF OVERVIEW PROXY
 // ═══════════════════════════════════════════════════════
 
-// getReadAllToken: ambil token dari header dulu, fallback ke env
 func getReadAllToken(r *http.Request) string {
 	if t := r.Header.Get("X-CF-Read-Token"); t != "" {
 		return t
@@ -538,19 +332,14 @@ func getReadAllToken(r *http.Request) string {
 	return os.Getenv("CF_READ_ALL_TOKEN")
 }
 
-// cfGet: generic proxy GET ke Cloudflare REST API
 func cfGet(w http.ResponseWriter, token, apiPath string) {
 	w.Header().Set("Content-Type", "application/json")
 	if token == "" {
 		w.WriteHeader(http.StatusUnauthorized)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success": false,
-			"error":   "CF_READ_ALL_TOKEN belum diatur di .env root project",
-		})
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "CF_READ_ALL_TOKEN belum diatur"})
 		return
 	}
-	url := "https://api.cloudflare.com/client/v4" + apiPath
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest("GET", "https://api.cloudflare.com/client/v4"+apiPath, nil)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
@@ -562,34 +351,25 @@ func cfGet(w http.ResponseWriter, token, apiPath string) {
 	resp, err := client.Do(req)
 	if err != nil {
 		w.WriteHeader(http.StatusBadGateway)
-		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "Gagal konek ke Cloudflare: " + err.Error()})
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
 		return
 	}
 	defer resp.Body.Close()
 	body, _ := ioutil.ReadAll(resp.Body)
-	log.Printf("📥 CF API [%s] status: %d", apiPath, resp.StatusCode)
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body)
 }
 
-// GET /api/cf/verify
 func cfVerifyTokenHandler(w http.ResponseWriter, r *http.Request) {
 	cfGet(w, getReadAllToken(r), "/user/tokens/verify")
 }
-
-// GET /api/cf/accounts
 func cfAccountsHandler(w http.ResponseWriter, r *http.Request) {
 	cfGet(w, getReadAllToken(r), "/accounts?per_page=10")
 }
-
-// GET /api/cf/zones
 func cfZonesHandler(w http.ResponseWriter, r *http.Request) {
 	cfGet(w, getReadAllToken(r), "/zones?per_page=20")
 }
-
-// GET /api/cf/dns?zone_id=xxx
 func cfDNSHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
 	zoneID := r.URL.Query().Get("zone_id")
 	if zoneID == "" {
 		w.WriteHeader(http.StatusBadRequest)
@@ -598,10 +378,7 @@ func cfDNSHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	cfGet(w, getReadAllToken(r), "/zones/"+zoneID+"/dns_records?per_page=50&order=type")
 }
-
-// GET /api/cf/firewall?zone_id=xxx
 func cfFirewallHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
 	zoneID := r.URL.Query().Get("zone_id")
 	if zoneID == "" {
 		w.WriteHeader(http.StatusBadRequest)
@@ -610,10 +387,7 @@ func cfFirewallHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	cfGet(w, getReadAllToken(r), "/zones/"+zoneID+"/firewall/rules?per_page=20")
 }
-
-// GET /api/cf/pagerules?zone_id=xxx
 func cfPageRulesHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
 	zoneID := r.URL.Query().Get("zone_id")
 	if zoneID == "" {
 		w.WriteHeader(http.StatusBadRequest)
@@ -622,8 +396,16 @@ func cfPageRulesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	cfGet(w, getReadAllToken(r), "/zones/"+zoneID+"/pagerules?status=active&per_page=20")
 }
+func cfWAFHandler(w http.ResponseWriter, r *http.Request) {
+	zoneID := r.URL.Query().Get("zone_id")
+	if zoneID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "zone_id wajib diisi"})
+		return
+	}
+	cfGet(w, getReadAllToken(r), "/zones/"+zoneID+"/rulesets?phase=http_request_firewall_custom")
+}
 
-// GET /api/cf/ssl?zone_id=xxx — paralel fetch semua settings sekaligus
 func cfSSLHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	token := getReadAllToken(r)
@@ -640,8 +422,7 @@ func cfSSLHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	fetchSetting := func(setting string) interface{} {
-		url := "https://api.cloudflare.com/client/v4/zones/" + zoneID + "/settings/" + setting
-		req, err := http.NewRequest("GET", url, nil)
+		req, err := http.NewRequest("GET", "https://api.cloudflare.com/client/v4/zones/"+zoneID+"/settings/"+setting, nil)
 		if err != nil {
 			return nil
 		}
@@ -677,29 +458,89 @@ func cfSSLHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "result": results})
 }
 
-// GET /api/cf/waf?zone_id=xxx — WAF custom rules (newer API)
-func cfWAFHandler(w http.ResponseWriter, r *http.Request) {
+// ═══════════════════════════════════════════════════════
+// PAKASIR PAYMENT
+// ═══════════════════════════════════════════════════════
+
+func pakasirHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	zoneID := r.URL.Query().Get("zone_id")
-	if zoneID == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": "zone_id wajib diisi"})
+
+	if r.Method != "POST" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
 		return
 	}
-	cfGet(w, getReadAllToken(r), "/zones/"+zoneID+"/rulesets?phase=http_request_firewall_custom")
+
+	bodyBytes, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to read request body"})
+		return
+	}
+
+	var reqBody PakasirRequest
+	if err := json.Unmarshal(bodyBytes, &reqBody); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"})
+		return
+	}
+
+	if reqBody.OrderID == "" || reqBody.Amount <= 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "order_id dan amount wajib diisi"})
+		return
+	}
+
+	paymentMethod := reqBody.PaymentMethod
+	if paymentMethod == "" {
+		paymentMethod = "qris"
+	}
+
+	pakasirProject := os.Getenv("PAKASIR_PROJECT")
+	if pakasirProject == "" {
+		pakasirProject = "feelin"
+	}
+	pakasirApiKey := os.Getenv("PAKASIR_API_KEY")
+	if pakasirApiKey == "" {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Server misconfiguration"})
+		return
+	}
+
+	pakasirReq := map[string]interface{}{
+		"project":  pakasirProject,
+		"order_id": reqBody.OrderID,
+		"amount":   reqBody.Amount,
+		"api_key":  pakasirApiKey,
+	}
+
+	payloadBytes, _ := json.Marshal(pakasirReq)
+	pakasirURL := fmt.Sprintf("https://app.pakasir.com/api/transactioncreate/%s", paymentMethod)
+
+	req, err := http.NewRequest("POST", pakasirURL, bytes.NewBuffer(payloadBytes))
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to create request"})
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to connect to Pakasir API"})
+		return
+	}
+	defer resp.Body.Close()
+
+	body, _ := ioutil.ReadAll(resp.Body)
+	log.Printf("✅ Pakasir response [%d]: %s", resp.StatusCode, string(body))
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
 }
 
-// PakasirWebhookPayload struktur untuk menerima webhook dari Pakasir
-type PakasirWebhookPayload struct {
-	OrderID       string `json:"order_id"`
-	Amount        int    `json:"amount"`
-	Project       string `json:"project"`
-	Status        string `json:"status"`
-	PaymentMethod string `json:"payment_method"`
-	CompletedAt   string `json:"completed_at"`
-}
-
-// Handler untuk Pakasir Webhook - menerima notifikasi pembayaran
 func pakasirWebhookHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -709,10 +550,8 @@ func pakasirWebhookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read request body
 	bodyBytes, err := ioutil.ReadAll(r.Body)
 	if err != nil {
-		log.Printf("❌ Webhook: Failed to read body: %v", err)
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to read request body"})
 		return
@@ -720,23 +559,13 @@ func pakasirWebhookHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("🔔 WEBHOOK RECEIVED: %s", string(bodyBytes))
 
-	// Parse webhook payload
 	var payload PakasirWebhookPayload
 	if err := json.Unmarshal(bodyBytes, &payload); err != nil {
-		log.Printf("❌ Webhook: Failed to parse body: %v", err)
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid payload"})
 		return
 	}
 
-	log.Printf("💰 PAYMENT WEBHOOK:")
-	log.Printf("   Order ID: %s", payload.OrderID)
-	log.Printf("   Amount: %d", payload.Amount)
-	log.Printf("   Status: %s", payload.Status)
-	log.Printf("   Payment Method: %s", payload.PaymentMethod)
-	log.Printf("   Completed At: %s", payload.CompletedAt)
-
-	// Simpan status pembayaran ke memory
 	paymentMutex.Lock()
 	paymentStatuses[payload.OrderID] = &PaymentStatus{
 		OrderID:       payload.OrderID,
@@ -747,16 +576,11 @@ func pakasirWebhookHandler(w http.ResponseWriter, r *http.Request) {
 		ReceivedAt:    time.Now(),
 	}
 	paymentMutex.Unlock()
-	log.Printf("💾 Payment status saved to memory for order: %s", payload.OrderID)
 
-	// Update Firestore via Vercel API (optional, untuk backup)
 	if payload.Status == "completed" || payload.Status == "success" || payload.Status == "paid" {
-		log.Printf("✅ PAYMENT COMPLETED for order: %s", payload.OrderID)
 		go updateOrderPaymentStatus(payload)
 	}
 
-	// Return success response ke Pakasir
-	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":  true,
 		"message":  "Webhook received",
@@ -765,23 +589,17 @@ func pakasirWebhookHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// updateOrderPaymentStatus - call Vercel API to update Firestore
 func updateOrderPaymentStatus(payload PakasirWebhookPayload) {
-	// FRONTEND_URL: primary frontend base URL (set in env). If empty,
-	// fall back to the production frontend https://www.feelin.my.id
 	frontendURL := os.Getenv("FRONTEND_URL")
 	if frontendURL == "" {
 		frontendURL = "https://www.feelin.my.id"
 	}
 
-	// Candidate endpoints to try (in order):
-	// 1) FRONTEND_URL + /api/update-payment-status
-	// 2) https://www.feelin.my.id/api/update-payment-status (fallback)
-	candidates := []string{}
-	candidates = append(candidates, strings.TrimRight(frontendURL, "/")+"/api/update-payment-status")
-	candidates = append(candidates, "https://www.feelin.my.id/api/update-payment-status")
+	candidates := []string{
+		strings.TrimRight(frontendURL, "/") + "/api/update-payment-status",
+		"https://www.feelin.my.id/api/update-payment-status",
+	}
 
-	// Prepare request body
 	requestBody, err := json.Marshal(map[string]interface{}{
 		"order_id":       payload.OrderID,
 		"amount":         payload.Amount,
@@ -793,39 +611,27 @@ func updateOrderPaymentStatus(payload PakasirWebhookPayload) {
 		log.Printf("❌ Failed to marshal update request: %v", err)
 		return
 	}
-	// Try each candidate until one succeeds
+
 	client := &http.Client{Timeout: 30 * time.Second}
-	for _, apiEndpoint := range candidates {
-		log.Printf("📤 Trying update endpoint: %s", apiEndpoint)
-		req, err := http.NewRequest("POST", apiEndpoint, bytes.NewBuffer(requestBody))
+	for _, endpoint := range candidates {
+		req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(requestBody))
 		if err != nil {
-			log.Printf("❌ Failed to create request for %s: %v", apiEndpoint, err)
 			continue
 		}
 		req.Header.Set("Content-Type", "application/json")
-
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Printf("❌ Failed to call %s: %v", apiEndpoint, err)
 			continue
 		}
-
-		respBody, _ := ioutil.ReadAll(resp.Body)
 		resp.Body.Close()
-		log.Printf("📥 Response from %s [%d]: %s", apiEndpoint, resp.StatusCode, string(respBody))
-
 		if resp.StatusCode == http.StatusOK {
-			log.Printf("✅ Firestore updated successfully for order: %s via %s", payload.OrderID, apiEndpoint)
+			log.Printf("✅ Firestore updated for order: %s", payload.OrderID)
 			return
 		}
-
-		log.Printf("⚠️ Endpoint %s returned status: %d - trying next candidate if any", apiEndpoint, resp.StatusCode)
 	}
-
 	log.Printf("❌ All update endpoints failed for order: %s", payload.OrderID)
 }
 
-// Handler untuk cek status pembayaran
 func checkPaymentStatusHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -847,7 +653,6 @@ func checkPaymentStatusHandler(w http.ResponseWriter, r *http.Request) {
 	paymentMutex.RUnlock()
 
 	if !exists {
-		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"success":  true,
 			"order_id": orderID,
@@ -858,7 +663,6 @@ func checkPaymentStatusHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":        true,
 		"order_id":       orderID,
@@ -871,69 +675,349 @@ func checkPaymentStatusHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func main() {
-	// Load .env dari root project
-	// Di Railway: env var sudah di-set di dashboard, Load() gagal tapi tidak masalah
-	// Di local: baca dari .env di root project (tempat go run dijalankan)
-	godotenv.Load(".env")    // root project
-	godotenv.Load("../.env") // fallback jika dijalankan dari subfolder
+// ═══════════════════════════════════════════════════════
+// SUBMIT APPLICATION — upload file + kirim email ke HR
+// POST /api/submit-application
+// ═══════════════════════════════════════════════════════
 
-	zoneID := os.Getenv("ZONE_ID")
-	apiToken := os.Getenv("CLOUDFLARE_API_TOKEN")
-	readAllToken := os.Getenv("CF_READ_ALL_TOKEN")
+func uploadToCloudinary(fileBytes []byte, filename, label string) UploadResult {
+	cloudName := os.Getenv("CLOUDINARY_CLOUD_NAME")
+	uploadPreset := os.Getenv("CLOUDINARY_UPLOAD_PRESET")
+	if cloudName == "" {
+		cloudName = "diljtaox1"
+	}
+	if uploadPreset == "" {
+		uploadPreset = "feelin_coffee_recruitment"
+	}
+
+	log.Printf("☁️  [Cloudinary] %s: %s", label, filename)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	writer.WriteField("upload_preset", uploadPreset)
+	writer.WriteField("folder", "feelin-coffee-recruitment")
+	part, err := writer.CreateFormFile("file", filename)
+	if err != nil {
+		return UploadResult{Error: err.Error()}
+	}
+	part.Write(fileBytes)
+	writer.Close()
+
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("https://api.cloudinary.com/v1_1/%s/image/upload", cloudName),
+		&body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return UploadResult{Error: "Cloudinary error: " + err.Error()}
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := ioutil.ReadAll(resp.Body)
+	var result map[string]interface{}
+	json.Unmarshal(respBody, &result)
+
+	if secureURL, ok := result["secure_url"].(string); ok {
+		log.Printf("✅ [Cloudinary] %s → %s", label, secureURL)
+		return UploadResult{Success: true, URL: secureURL}
+	}
+
+	errMsg := "Unknown Cloudinary error"
+	if errObj, ok := result["error"].(map[string]interface{}); ok {
+		if msg, ok := errObj["message"].(string); ok {
+			errMsg = msg
+		}
+	}
+	return UploadResult{Error: errMsg}
+}
+
+func uploadToLitterbox(fileBytes []byte, filename, label string) UploadResult {
+	log.Printf("📦 [Litterbox] %s: %s", label, filename)
+
+	doUpload := func(apiURL, timeParam string) (string, error) {
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		writer.WriteField("reqtype", "fileupload")
+		if timeParam != "" {
+			writer.WriteField("time", timeParam)
+		}
+		part, err := writer.CreateFormFile("fileToUpload", filename)
+		if err != nil {
+			return "", err
+		}
+		part.Write(fileBytes)
+		writer.Close()
+
+		req, _ := http.NewRequest("POST", apiURL, &body)
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		client := &http.Client{Timeout: 60 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+		respBytes, _ := ioutil.ReadAll(resp.Body)
+		url := strings.TrimSpace(string(respBytes))
+		if strings.HasPrefix(url, "https://") {
+			return url, nil
+		}
+		return "", fmt.Errorf("invalid response: %s", url)
+	}
+
+	// Coba Litterbox (72h)
+	url, err := doUpload("https://litterbox.catbox.moe/resources/internals/api.php", "72h")
+	if err == nil {
+		log.Printf("✅ [Litterbox] %s → %s", label, url)
+		return UploadResult{Success: true, URL: url}
+	}
+	log.Printf("⚠️  Litterbox gagal (%s), fallback Catbox...", err.Error())
+
+	// Fallback Catbox (permanen)
+	url, err = doUpload("https://catbox.moe/user/api.php", "")
+	if err == nil {
+		log.Printf("✅ [Catbox] %s → %s", label, url)
+		return UploadResult{Success: true, URL: url}
+	}
+
+	return UploadResult{Error: "Litterbox & Catbox gagal: " + err.Error()}
+}
+
+func orDefault(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
+}
+
+func sendEmailToHR(fields map[string]string, urls ApplicationFileURLs) error {
+	hrEmail := os.Getenv("HR_EMAIL")
+	if hrEmail == "" {
+		hrEmail = "hudzaifaharantisi17@gmail.com"
+	}
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+
+	wf := func(k, v string) { writer.WriteField(k, v) }
+	wf("_subject", fmt.Sprintf("📋 Lamaran Baru: %s - %s", fields["position"], fields["fullName"]))
+	wf("Posisi", fields["position"])
+	wf("Nama_Lengkap", fields["fullName"])
+	wf("Email", fields["email"])
+	wf("Telepon", fields["phone"])
+	wf("Usia", fields["age"]+" tahun")
+	wf("Alamat", fields["address"])
+	wf("Pendidikan", fields["education"])
+	wf("Pengalaman", orDefault(fields["experience"], "Tidak ada"))
+	wf("Informasi_Tambahan", orDefault(fields["additionalInfo"], "-"))
+	wf("Tanggal_Melamar", time.Now().Format("02 January 2006 15:04"))
+	wf("CV", orDefault(urls.CvURL, "Tidak ada"))
+	wf("Foto", orDefault(urls.PhotoURL, "Tidak ada"))
+	wf("KTP", orDefault(urls.KtpURL, "Tidak ada"))
+	wf("Sertifikat", orDefault(urls.CertificateURL, "Tidak ada"))
+	wf("_captcha", "false")
+	wf("_template", "table")
+	writer.Close()
+
+	req, _ := http.NewRequest("POST",
+		fmt.Sprintf("https://formsubmit.co/ajax/%s", hrEmail),
+		&body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("FormSubmit HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func submitApplicationHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method != "POST" {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
+		return
+	}
+
+	// Parse multipart form (max 20MB)
+	if err := r.ParseMultipartForm(20 << 20); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to parse form: " + err.Error()})
+		return
+	}
+
+	fields := map[string]string{
+		"position":       r.FormValue("position"),
+		"fullName":       r.FormValue("fullName"),
+		"email":          r.FormValue("email"),
+		"phone":          r.FormValue("phone"),
+		"age":            r.FormValue("age"),
+		"address":        r.FormValue("address"),
+		"education":      r.FormValue("education"),
+		"experience":     r.FormValue("experience"),
+		"additionalInfo": r.FormValue("additionalInfo"),
+	}
+
+	log.Printf("📨 Lamaran masuk: %s → %s", fields["fullName"], fields["position"])
+
+	// Helper baca file dari form
+	readFile := func(key string) ([]byte, string, bool) {
+		file, header, err := r.FormFile(key)
+		if err != nil {
+			return nil, "", false
+		}
+		defer file.Close()
+		data, err := ioutil.ReadAll(file)
+		if err != nil {
+			return nil, "", false
+		}
+		return data, header.Filename, true
+	}
+
+	// Upload semua file secara parallel
+	type uploadJob struct {
+		key    string
+		result UploadResult
+	}
+	ch := make(chan uploadJob, 4)
+
+	uploadAsync := func(key, linkKey string, useCloudinary bool) {
+		if link := r.FormValue(linkKey); link != "" {
+			ch <- uploadJob{key, UploadResult{Success: true, URL: link}}
+			return
+		}
+		data, filename, ok := readFile(key + "File")
+		if !ok {
+			ch <- uploadJob{key, UploadResult{}}
+			return
+		}
+		if useCloudinary {
+			ch <- uploadJob{key, uploadToCloudinary(data, filename, key)}
+		} else {
+			ch <- uploadJob{key, uploadToLitterbox(data, filename, key)}
+		}
+	}
+
+	go uploadAsync("cv", "cvLink", false)        // CV → Litterbox
+	go uploadAsync("photo", "photoLink", true)    // Foto → Cloudinary
+	go uploadAsync("ktp", "ktpLink", true)        // KTP → Cloudinary
+	go func() {                                    // Sertifikat → auto
+		if link := r.FormValue("certificateLink"); link != "" {
+			ch <- uploadJob{"certificate", UploadResult{Success: true, URL: link}}
+			return
+		}
+		data, filename, ok := readFile("certificateFile")
+		if !ok {
+			ch <- uploadJob{"certificate", UploadResult{}}
+			return
+		}
+		ext := ""
+		if idx := strings.LastIndex(filename, "."); idx >= 0 {
+			ext = strings.ToLower(filename[idx+1:])
+		}
+		if ext == "pdf" {
+			ch <- uploadJob{"certificate", uploadToLitterbox(data, filename, "Sertifikat")}
+		} else {
+			ch <- uploadJob{"certificate", uploadToCloudinary(data, filename, "Sertifikat")}
+		}
+	}()
+
+	// Kumpulkan hasil upload
+	urls := ApplicationFileURLs{}
+	for i := 0; i < 4; i++ {
+		job := <-ch
+		switch job.key {
+		case "cv":
+			urls.CvURL = job.result.URL
+		case "photo":
+			urls.PhotoURL = job.result.URL
+		case "ktp":
+			urls.KtpURL = job.result.URL
+		case "certificate":
+			urls.CertificateURL = job.result.URL
+		}
+	}
+
+	log.Printf("📊 URLs → cv:%s photo:%s ktp:%s cert:%s",
+		urls.CvURL, urls.PhotoURL, urls.KtpURL, urls.CertificateURL)
+
+	// Kirim email ke HR
+	emailSuccess := true
+	if err := sendEmailToHR(fields, urls); err != nil {
+		log.Printf("⚠️  Email HR gagal: %v", err)
+		emailSuccess = false
+	} else {
+		log.Printf("✅ Email HR terkirim")
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":      true,
+		"emailSuccess": emailSuccess,
+		"fileUrls":     urls,
+		"message":      "Lamaran berhasil diproses",
+	})
+}
+
+// ═══════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════
+
+func main() {
+	godotenv.Load(".env")
+	godotenv.Load("../.env")
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
-	// Clean startup banner
-	fmt.Println()
-	fmt.Println("  ☁️  Cloudflare Analytics Server v4.0.0")
-	fmt.Println("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-	fmt.Printf("  🌐 http://localhost:%s\n", port)
-	fmt.Println()
+	zoneID := os.Getenv("ZONE_ID")
+	apiToken := os.Getenv("CLOUDFLARE_API_TOKEN")
+	readAllToken := os.Getenv("CF_READ_ALL_TOKEN")
+	cloudinaryName := os.Getenv("CLOUDINARY_CLOUD_NAME")
 
-	// Status indicators
-	if zoneID != "" {
-		fmt.Printf("  ✓ Zone ID configured\n")
-	} else {
-		fmt.Printf("  ✗ Zone ID missing\n")
+	fmt.Println()
+	fmt.Println("  ☕ Feelin Coffee Server v5.0.0")
+	fmt.Println("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	fmt.Printf("  🌐 http://localhost:%s\n\n", port)
+
+	checkEnv := func(label, val string) {
+		if val != "" {
+			fmt.Printf("  ✓ %s\n", label)
+		} else {
+			fmt.Printf("  ✗ %s missing\n", label)
+		}
 	}
-	if apiToken != "" {
-		fmt.Printf("  ✓ Analytics API ready\n")
-	} else {
-		fmt.Printf("  ✗ Analytics API token missing\n")
-	}
-	if readAllToken != "" {
-		fmt.Printf("  ✓ CF Read All token ready\n")
-	} else {
-		fmt.Printf("  ✗ CF_READ_ALL_TOKEN missing di .env root project\n")
-	}
+	checkEnv("Zone ID", zoneID)
+	checkEnv("Cloudflare Analytics Token", apiToken)
+	checkEnv("CF Read All Token", readAllToken)
+	checkEnv("Cloudinary Cloud Name", cloudinaryName)
 
 	fmt.Println()
 	fmt.Println("  📡 Endpoints:")
-	fmt.Println("     /api/cloudflare-analytics")
-	fmt.Println("     /api/cf/verify")
-	fmt.Println("     /api/cf/accounts")
-	fmt.Println("     /api/cf/zones")
-	fmt.Println("     /api/cf/dns?zone_id=xxx")
-	fmt.Println("     /api/cf/firewall?zone_id=xxx")
-	fmt.Println("     /api/cf/pagerules?zone_id=xxx")
-	fmt.Println("     /api/cf/ssl?zone_id=xxx")
-	fmt.Println("     /api/pakasir-create-transaction")
-	fmt.Println("     /api/pakasir-webhook")
-	fmt.Println("     /api/webhook/pakasir          <- Webhook URL untuk Pakasir (ngrok)")
-	fmt.Println("     /api/check-payment-status     <- Polling endpoint untuk frontend")
-	fmt.Println("     /api/health")
+	fmt.Println("     POST /api/submit-application   ← Lamaran kerja")
+	fmt.Println("     GET  /api/cloudflare-analytics")
+	fmt.Println("     GET  /api/cf/verify|accounts|zones|dns|firewall|pagerules|ssl|waf")
+	fmt.Println("     POST /api/pakasir-create-transaction")
+	fmt.Println("     POST /api/pakasir-webhook")
+	fmt.Println("     GET  /api/check-payment-status")
+	fmt.Println("     GET  /api/health | /api/test | /api/cf/debug")
 	fmt.Println()
 	fmt.Println("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	fmt.Println("  🚀 Server ready!")
 	fmt.Println()
 
-	// Setup routes dengan CORS middleware
+	// Routes
+	http.HandleFunc("/api/submit-application", corsMiddleware(submitApplicationHandler))
 	http.HandleFunc("/api/cloudflare-analytics", corsMiddleware(cloudflareHandler))
-	// CF Overview proxy routes (Read All Resources)
 	http.HandleFunc("/api/cf/verify", corsMiddleware(cfVerifyTokenHandler))
 	http.HandleFunc("/api/cf/accounts", corsMiddleware(cfAccountsHandler))
 	http.HandleFunc("/api/cf/zones", corsMiddleware(cfZonesHandler))
@@ -942,7 +1026,6 @@ func main() {
 	http.HandleFunc("/api/cf/pagerules", corsMiddleware(cfPageRulesHandler))
 	http.HandleFunc("/api/cf/ssl", corsMiddleware(cfSSLHandler))
 	http.HandleFunc("/api/cf/waf", corsMiddleware(cfWAFHandler))
-	// Pakasir & Webhook
 	http.HandleFunc("/api/pakasir-create-transaction", corsMiddleware(pakasirHandler))
 	http.HandleFunc("/api/pakasir-webhook", corsMiddleware(pakasirWebhookHandler))
 	http.HandleFunc("/api/webhook/pakasir", corsMiddleware(pakasirWebhookHandler))
