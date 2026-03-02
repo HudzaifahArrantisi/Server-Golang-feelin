@@ -18,7 +18,6 @@ import (
 	gomail "gopkg.in/gomail.v2"
 )
 
-// ─── Structs ──────────────────────────────────────────────────────────────────
 
 type PaymentStatus struct {
 	OrderID       string    `json:"order_id"`
@@ -68,7 +67,6 @@ type PakasirWebhookPayload struct {
 	CompletedAt   string `json:"completed_at"`
 }
 
-// ─── Upload result struct ─────────────────────────────────────────────────────
 
 type UploadResult struct {
 	Success bool
@@ -83,9 +81,6 @@ type ApplicationFileURLs struct {
 	CertificateURL string `json:"certificateUrl"`
 }
 
-// ═══════════════════════════════════════════════════════
-// CORS MIDDLEWARE
-// ═══════════════════════════════════════════════════════
 
 func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -132,9 +127,6 @@ func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// ═══════════════════════════════════════════════════════
-// CLOUDFLARE ANALYTICS
-// ═══════════════════════════════════════════════════════
 
 func cloudflareHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -237,9 +229,6 @@ func cloudflareHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(CloudflareResponse{Status: "success", Data: result, Zone: zoneID})
 }
 
-// ═══════════════════════════════════════════════════════
-// HEALTH & TEST
-// ═══════════════════════════════════════════════════════
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -321,11 +310,7 @@ func cfDebugHandler(w http.ResponseWriter, r *http.Request) {
 		},
 		"cloudflare_verify_test": verifyStatus,
 	})
-}
 
-// ═══════════════════════════════════════════════════════
-// CF OVERVIEW PROXY
-// ═══════════════════════════════════════════════════════
 
 func getReadAllToken(r *http.Request) string {
 	if t := r.Header.Get("X-CF-Read-Token"); t != "" {
@@ -459,10 +444,6 @@ func cfSSLHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "result": results})
 }
-
-// ═══════════════════════════════════════════════════════
-// PAKASIR PAYMENT
-// ═══════════════════════════════════════════════════════
 
 func pakasirHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -677,12 +658,9 @@ func checkPaymentStatusHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ═══════════════════════════════════════════════════════
-// SUBMIT APPLICATION
-// POST /api/submit-application
-// ═══════════════════════════════════════════════════════
 
-// ✅ FIX: Deteksi resource_type berdasarkan ekstensi agar PDF tidak ditolak Cloudinary
+
+// submit apk buat email 
 func uploadToCloudinary(fileBytes []byte, filename, label string) UploadResult {
 	cloudName := os.Getenv("CLOUDINARY_CLOUD_NAME")
 	uploadPreset := os.Getenv("CLOUDINARY_UPLOAD_PRESET")
@@ -695,7 +673,6 @@ func uploadToCloudinary(fileBytes []byte, filename, label string) UploadResult {
 
 	log.Printf("☁️  [Cloudinary] %s: %s", label, filename)
 
-	// Deteksi resource_type berdasarkan ekstensi
 	ext := ""
 	if idx := strings.LastIndex(filename, "."); idx >= 0 {
 		ext = strings.ToLower(filename[idx+1:])
@@ -717,7 +694,6 @@ func uploadToCloudinary(fileBytes []byte, filename, label string) UploadResult {
 	part.Write(fileBytes)
 	writer.Close()
 
-	// ✅ FIX: Pakai resource_type yang sesuai di URL endpoint
 	uploadURL := fmt.Sprintf("https://api.cloudinary.com/v1_1/%s/%s/upload", cloudName, resourceType)
 	log.Printf("☁️  [Cloudinary] URL: %s (resource_type=%s)", uploadURL, resourceType)
 
@@ -788,7 +764,6 @@ func uploadToLitterbox(fileBytes []byte, filename, label string) UploadResult {
 		return "", fmt.Errorf("invalid response: %s", url)
 	}
 
-	// Coba Litterbox (72h)
 	url, err := doUpload("https://litterbox.catbox.moe/resources/internals/api.php", "72h")
 	if err == nil {
 		log.Printf(" [Litterbox] %s → %s", label, url)
@@ -814,7 +789,6 @@ func orDefault(s, def string) string {
 }
 
 func sendEmailToHR(fields map[string]string, urls ApplicationFileURLs) error {
-	// ── SMTP config from env ───────────────────────────────────
 	smtpHost := os.Getenv("SMTP_HOST")
 	if smtpHost == "" {
 		smtpHost = "smtp.gmail.com"
@@ -840,7 +814,6 @@ func sendEmailToHR(fields map[string]string, urls ApplicationFileURLs) error {
 		hrEmail = "hudzaifaharantisi17@gmail.com"
 	}
 
-	// ── Build HTML table ───────────────────────────────────────
 	row := func(label, value string) string {
 		v := orDefault(value, "Tidak ada")
 		return fmt.Sprintf(`<tr><td style="padding:8px 12px;border:1px solid #ddd;font-weight:bold;background:#f9f9f9;">%s</td><td style="padding:8px 12px;border:1px solid #ddd;">%s</td></tr>`, label, v)
@@ -876,7 +849,6 @@ func sendEmailToHR(fields map[string]string, urls ApplicationFileURLs) error {
 		linkCell("Sertifikat", urls.CertificateURL),
 	)
 
-	// ── Compose & send ────────────────────────────────────────
 	m := gomail.NewMessage()
 	m.SetHeader("From", smtpUser)
 	m.SetHeader("To", hrEmail)
@@ -900,7 +872,6 @@ func submitApplicationHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse multipart form (max 20MB)
 	if err := r.ParseMultipartForm(20 << 20); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to parse form: " + err.Error()})
@@ -921,7 +892,6 @@ func submitApplicationHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("📨 Lamaran masuk: %s → %s", fields["fullName"], fields["position"])
 
-	// ✅ Helper baca file dari form dengan logging
 	readFile := func(key string) ([]byte, string, bool) {
 		file, header, err := r.FormFile(key)
 		if err != nil {
@@ -937,7 +907,6 @@ func submitApplicationHandler(w http.ResponseWriter, r *http.Request) {
 		return data, header.Filename, true
 	}
 
-	// Upload semua file secara parallel
 	type uploadJob struct {
 		key    string
 		result UploadResult
@@ -945,13 +914,11 @@ func submitApplicationHandler(w http.ResponseWriter, r *http.Request) {
 	ch := make(chan uploadJob, 4)
 
 	uploadAsync := func(key, linkKey string, useCloudinary bool) {
-		// Prioritaskan link manual
 		if link := r.FormValue(linkKey); link != "" {
 			log.Printf("🔗 %s: pakai link manual → %s", key, link)
 			ch <- uploadJob{key, UploadResult{Success: true, URL: link}}
 			return
 		}
-		// Coba baca file
 		data, filename, ok := readFile(key + "File")
 		if !ok {
 			log.Printf("ℹ️  %s: tidak ada file dan tidak ada link", key)
@@ -969,7 +936,6 @@ func submitApplicationHandler(w http.ResponseWriter, r *http.Request) {
 	go uploadAsync("photo", "photoLink", true)  // Foto → Cloudinary
 	go uploadAsync("ktp",   "ktpLink",   true)  // KTP → Cloudinary
 
-	// Sertifikat: PDF → Litterbox, gambar → Cloudinary
 	go func() {
 		if link := r.FormValue("certificateLink"); link != "" {
 			log.Printf("🔗 certificate: pakai link manual → %s", link)
@@ -993,7 +959,6 @@ func submitApplicationHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// Kumpulkan hasil upload
 	urls := ApplicationFileURLs{}
 	uploadErrors := []string{}
 
@@ -1023,7 +988,6 @@ func submitApplicationHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("📊 Final URLs → cv:%q photo:%q ktp:%q cert:%q",
 		urls.CvURL, urls.PhotoURL, urls.KtpURL, urls.CertificateURL)
 
-	// Kirim email ke HR
 	emailSuccess := true
 	if err := sendEmailToHR(fields, urls); err != nil {
 		log.Printf("⚠️  Email HR gagal: %v", err)
@@ -1032,7 +996,6 @@ func submitApplicationHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("✅ Email HR terkirim")
 	}
 
-	// ✅ Response lengkap ke frontend — fileUrls wajib ada agar Firestore bisa simpan URL
 	response := map[string]interface{}{
 		"success":      true,
 		"emailSuccess": emailSuccess,
@@ -1046,9 +1009,6 @@ func submitApplicationHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-// ═══════════════════════════════════════════════════════
-// MAIN
-// ═══════════════════════════════════════════════════════
 
 func main() {
 	godotenv.Load(".env")
