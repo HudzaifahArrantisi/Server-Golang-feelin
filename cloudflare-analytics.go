@@ -9,11 +9,13 @@ import (
 	"mime/multipart"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/joho/godotenv"
+	gomail "gopkg.in/gomail.v2"
 )
 
 // ─── Structs ──────────────────────────────────────────────────────────────────
@@ -733,13 +735,13 @@ func uploadToCloudinary(fileBytes []byte, filename, label string) UploadResult {
 	defer resp.Body.Close()
 
 	respBody, _ := ioutil.ReadAll(resp.Body)
-	log.Printf("☁️  [Cloudinary] Response HTTP %d: %s", resp.StatusCode, string(respBody))
+	log.Printf(" [Cloudinary] Response HTTP %d: %s", resp.StatusCode, string(respBody))
 
 	var result map[string]interface{}
 	json.Unmarshal(respBody, &result)
 
 	if secureURL, ok := result["secure_url"].(string); ok && secureURL != "" {
-		log.Printf("✅ [Cloudinary] %s → %s", label, secureURL)
+		log.Printf(" [Cloudinary] %s → %s", label, secureURL)
 		return UploadResult{Success: true, URL: secureURL}
 	}
 
@@ -754,7 +756,7 @@ func uploadToCloudinary(fileBytes []byte, filename, label string) UploadResult {
 }
 
 func uploadToLitterbox(fileBytes []byte, filename, label string) UploadResult {
-	log.Printf("📦 [Litterbox] %s: %s", label, filename)
+	log.Printf("[Litterbox] %s: %s", label, filename)
 
 	doUpload := func(apiURL, timeParam string) (string, error) {
 		var body bytes.Buffer
@@ -789,7 +791,7 @@ func uploadToLitterbox(fileBytes []byte, filename, label string) UploadResult {
 	// Coba Litterbox (72h)
 	url, err := doUpload("https://litterbox.catbox.moe/resources/internals/api.php", "72h")
 	if err == nil {
-		log.Printf("✅ [Litterbox] %s → %s", label, url)
+		log.Printf(" [Litterbox] %s → %s", label, url)
 		return UploadResult{Success: true, URL: url}
 	}
 	log.Printf("⚠️  Litterbox gagal (%s), fallback Catbox...", err.Error())
@@ -797,7 +799,7 @@ func uploadToLitterbox(fileBytes []byte, filename, label string) UploadResult {
 	// Fallback Catbox (permanen)
 	url, err = doUpload("https://catbox.moe/user/api.php", "")
 	if err == nil {
-		log.Printf("✅ [Catbox] %s → %s", label, url)
+		log.Printf(" [Catbox] %s → %s", label, url)
 		return UploadResult{Success: true, URL: url}
 	}
 
@@ -812,51 +814,79 @@ func orDefault(s, def string) string {
 }
 
 func sendEmailToHR(fields map[string]string, urls ApplicationFileURLs) error {
+	// ── SMTP config from env ───────────────────────────────────
+	smtpHost := os.Getenv("SMTP_HOST")
+	if smtpHost == "" {
+		smtpHost = "smtp.gmail.com"
+	}
+	smtpPortStr := os.Getenv("SMTP_PORT")
+	if smtpPortStr == "" {
+		smtpPortStr = "587"
+	}
+	smtpPort, err := strconv.Atoi(smtpPortStr)
+	if err != nil {
+		return fmt.Errorf("SMTP_PORT tidak valid: %v", err)
+	}
+	smtpUser := os.Getenv("SMTP_USER")
+	if smtpUser == "" {
+		smtpUser = "hudzaifaharantisi17@gmail.com"
+	}
+	smtpPass := os.Getenv("SMTP_PASS")
+	if smtpPass == "" {
+		return fmt.Errorf("SMTP_PASS belum diatur – set Google App Password di environment variables")
+	}
 	hrEmail := os.Getenv("HR_EMAIL")
 	if hrEmail == "" {
 		hrEmail = "hudzaifaharantisi17@gmail.com"
 	}
 
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-
-	wf := func(k, v string) { writer.WriteField(k, v) }
-	wf("_subject", fmt.Sprintf("📋 Lamaran Baru: %s - %s", fields["position"], fields["fullName"]))
-	wf("Posisi", fields["position"])
-	wf("Nama_Lengkap", fields["fullName"])
-	wf("Email", fields["email"])
-	wf("Telepon", fields["phone"])
-	wf("Usia", fields["age"]+" tahun")
-	wf("Alamat", fields["address"])
-	wf("Pendidikan", fields["education"])
-	wf("Pengalaman", orDefault(fields["experience"], "Tidak ada"))
-	wf("Informasi_Tambahan", orDefault(fields["additionalInfo"], "-"))
-	wf("Tanggal_Melamar", time.Now().Format("02 January 2006 15:04"))
-	wf("CV", orDefault(urls.CvURL, "Tidak ada"))
-	wf("Foto", orDefault(urls.PhotoURL, "Tidak ada"))
-	wf("KTP", orDefault(urls.KtpURL, "Tidak ada"))
-	wf("Sertifikat", orDefault(urls.CertificateURL, "Tidak ada"))
-	wf("_captcha", "false")
-	wf("_template", "table")
-	writer.Close()
-
-	req, err := http.NewRequest("POST",
-		fmt.Sprintf("https://formsubmit.co/ajax/%s", hrEmail),
-		&body)
-	if err != nil {
-		return fmt.Errorf("NewRequest error: %v", err)
+	// ── Build HTML table ───────────────────────────────────────
+	row := func(label, value string) string {
+		v := orDefault(value, "Tidak ada")
+		return fmt.Sprintf(`<tr><td style="padding:8px 12px;border:1px solid #ddd;font-weight:bold;background:#f9f9f9;">%s</td><td style="padding:8px 12px;border:1px solid #ddd;">%s</td></tr>`, label, v)
 	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-	req.Header.Set("Accept", "application/json")
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
+	linkCell := func(label, url string) string {
+		if url == "" {
+			return row(label, "Tidak ada")
+		}
+		return fmt.Sprintf(`<tr><td style="padding:8px 12px;border:1px solid #ddd;font-weight:bold;background:#f9f9f9;">%s</td><td style="padding:8px 12px;border:1px solid #ddd;"><a href="%s" target="_blank">Lihat / Download</a></td></tr>`, label, url)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("FormSubmit HTTP %d", resp.StatusCode)
+
+	htmlBody := fmt.Sprintf(`
+<html><body style="font-family:Arial,sans-serif;">
+<h2 style="color:#4a2c2a;">📋 Lamaran Baru</h2>
+<table style="border-collapse:collapse;width:100%%;max-width:600px;">
+%s%s%s%s%s%s%s%s%s%s%s%s%s%s
+</table>
+<br><p style="color:#888;font-size:12px;">Email ini dikirim otomatis oleh sistem Feelin Coffee.</p>
+</body></html>`,
+		row("Posisi Dilamar", fields["position"]),
+		row("Nama Lengkap", fields["fullName"]),
+		row("Email Pelamar", fields["email"]),
+		row("Telepon", fields["phone"]),
+		row("Usia", orDefault(fields["age"], "Tidak ada")+" tahun"),
+		row("Alamat", fields["address"]),
+		row("Pendidikan Terakhir", fields["education"]),
+		row("Pengalaman Kerja", fields["experience"]),
+		row("Informasi Tambahan", orDefault(fields["additionalInfo"], "-")),
+		row("Tanggal Melamar", time.Now().Format("02 January 2006 15:04")),
+		linkCell("CV", urls.CvURL),
+		linkCell("Foto", urls.PhotoURL),
+		linkCell("KTP", urls.KtpURL),
+		linkCell("Sertifikat", urls.CertificateURL),
+	)
+
+	// ── Compose & send ────────────────────────────────────────
+	m := gomail.NewMessage()
+	m.SetHeader("From", smtpUser)
+	m.SetHeader("To", hrEmail)
+	m.SetHeader("Subject", fmt.Sprintf("📋 Lamaran Baru: %s - %s", fields["position"], fields["fullName"]))
+	m.SetBody("text/html", htmlBody)
+
+	d := gomail.NewDialer(smtpHost, smtpPort, smtpUser, smtpPass)
+
+	if err := d.DialAndSend(m); err != nil {
+		return fmt.Errorf("gagal kirim email via SMTP: %v", err)
 	}
 	return nil
 }
@@ -969,14 +999,13 @@ func submitApplicationHandler(w http.ResponseWriter, r *http.Request) {
 
 	for i := 0; i < 4; i++ {
 		job := <-ch
-		// ✅ FIX: Log setiap hasil — sukses maupun gagal
 		if job.result.Success {
-			log.Printf("✅ Upload %s berhasil → %s", job.key, job.result.URL)
+			log.Printf(" Upload %s berhasil → %s", job.key, job.result.URL)
 		} else if job.result.Error != "" {
-			log.Printf("❌ Upload %s GAGAL: %s", job.key, job.result.Error)
+			log.Printf(" Upload %s GAGAL: %s", job.key, job.result.Error)
 			uploadErrors = append(uploadErrors, fmt.Sprintf("%s: %s", job.key, job.result.Error))
 		} else {
-			log.Printf("ℹ️  Upload %s: tidak ada file/link", job.key)
+			log.Printf("ℹ Upload %s: tidak ada file/link", job.key)
 		}
 
 		switch job.key {
@@ -1036,7 +1065,7 @@ func main() {
 	cloudinaryName := os.Getenv("CLOUDINARY_CLOUD_NAME")
 
 	fmt.Println()
-	fmt.Println("  ☕ Feelin Coffee Server v5.0.0")
+	fmt.Println("  Feelin-server-Golang")
 	fmt.Println("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	fmt.Printf("  🌐 http://localhost:%s\n\n", port)
 
